@@ -8,7 +8,7 @@ export class SupplierSearchController {
 
   @Post('ai')
   search(@Body() dto: SearchRequirementDto) {
-    return this.supplierSearchService.search(dto.prompt);
+    return this.supplierSearchService.search(dto.prompt, dto.targetCount, dto.minScore);
   }
 
   @Get('jobs/:id')

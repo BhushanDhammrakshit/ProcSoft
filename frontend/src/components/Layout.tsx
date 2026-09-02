@@ -11,6 +11,7 @@ import {
   Typography,
 } from '@mui/material';
 import BusinessIcon from '@mui/icons-material/Business';
+import PersonIcon from '@mui/icons-material/Person';
 import TravelExploreIcon from '@mui/icons-material/TravelExplore';
 import RequestQuoteIcon from '@mui/icons-material/RequestQuote';
 import ReceiptLongIcon from '@mui/icons-material/ReceiptLong';
@@ -21,6 +22,7 @@ const drawerWidth = 240;
 
 const navItems = [
   { label: 'Suppliers', path: '/suppliers', icon: <BusinessIcon /> },
+  { label: 'Buyers', path: '/buyers', icon: <PersonIcon /> },
   { label: 'AI Supplier Search', path: '/supplier-search', icon: <TravelExploreIcon /> },
   { label: 'RFQs', path: '/rfqs', icon: <RequestQuoteIcon /> },
   { label: 'Purchase Orders', path: '/purchase-orders', icon: <ReceiptLongIcon /> },

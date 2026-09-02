@@ -1,16 +1,6 @@
-import {
-  IsArray,
-  IsEmail,
-  IsIn,
-  IsNumber,
-  IsOptional,
-  IsString,
-  Max,
-  Min,
-} from 'class-validator';
-import { Type } from 'class-transformer';
+import { IsArray, IsEmail, IsOptional, IsString } from 'class-validator';
 
-export class CreateSupplierDto {
+export class CreateBuyerDto {
   @IsString()
   legalName: string;
 
@@ -63,25 +53,13 @@ export class CreateSupplierDto {
 
   @IsOptional()
   @IsArray()
-  certifications?: string[];
-
-  @IsOptional()
-  @IsString()
-  paymentTerms?: string;
-
-  @IsOptional()
-  @IsArray()
-  categoryNames?: string[];
+  procurementCategories?: string[];
 }
 
-export class SearchSupplierDto {
+export class SearchBuyerDto {
   @IsOptional()
   @IsString()
-  q?: string; // free-text query across name/email/city/state
-
-  @IsOptional()
-  @IsString()
-  category?: string;
+  q?: string;
 
   @IsOptional()
   @IsString()
@@ -92,19 +70,6 @@ export class SearchSupplierDto {
   state?: string;
 
   @IsOptional()
-  @IsIn(['active', 'inactive', 'pending_verification'])
+  @IsString()
   status?: string;
-
-  @IsOptional()
-  @Type(() => Number)
-  @IsNumber()
-  @Min(1)
-  page?: number;
-
-  @IsOptional()
-  @Type(() => Number)
-  @IsNumber()
-  @Min(1)
-  @Max(100)
-  pageSize?: number;
 }

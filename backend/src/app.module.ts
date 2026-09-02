@@ -7,6 +7,7 @@ import { PurchaseOrdersModule } from './purchase-orders/purchase-orders.module';
 import { MailingModule } from './mailing/mailing.module';
 import { AiModule } from './ai/ai.module';
 import { SupplierSearchModule } from './supplier-search/supplier-search.module';
+import { BuyersModule } from './buyers/buyers.module';
 
 @Module({
   imports: [
@@ -39,6 +40,7 @@ import { SupplierSearchModule } from './supplier-search/supplier-search.module';
     MailingModule,
     AiModule,
     SupplierSearchModule,
+    BuyersModule,
   ],
 })
 export class AppModule {}

@@ -3,12 +3,55 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { DiscoveryJob, DiscoveryJobStatus } from './entities/discovery-job.entity';
 import { RawSupplierResult } from './dto/search-requirement.dto';
-import { AiService, SupplierRequirement } from '../ai/ai.service';
+import { ContactStatus, SupplierCandidate } from './dto/supplier-candidate.dto';
+import { AiService, SupplierRequirement, SupplierSuggestion } from '../ai/ai.service';
 import { SuppliersService } from '../suppliers/suppliers.service';
 import { ExternalSourceService } from './external-source.service';
+import { SupplierEnrichmentService } from './supplier-enrichment.service';
+import { SupplierVerificationStatus } from '../suppliers/entities/supplier.entity';
+import { classifyUrl, UrlClassification } from './util/url-classifier.util';
+import {
+  extractDomain,
+  isValidGstin,
+  normalizeCompanyName,
+  normalizePhone,
+  stringSimilarity,
+} from '../common/utils/normalization.util';
 
-const MIN_GOOD_MATCHES = 3;
-const GOOD_MATCH_SCORE_THRESHOLD = 3;
+const DEFAULT_TARGET_COUNT = Number(process.env.SUPPLIER_SEARCH_TARGET_COUNT ?? 10);
+const DEFAULT_MIN_SCORE = Number(process.env.SUPPLIER_SEARCH_MIN_SCORE ?? 70);
+const DEDUPE_CONFIDENCE_THRESHOLD = 0.82;
+// Caps how many raw leads get enriched/verified per discovery job (performance requirement -
+// don't fetch hundreds of supplier websites for one search).
+const MAX_CANDIDATES_PER_JOB = Number(process.env.SUPPLIER_SEARCH_MAX_CANDIDATES ?? 20);
+
+interface NormalizedResult {
+  legalName: string;
+  email: string | null;
+  phone?: string;
+  address?: string;
+  city?: string;
+  state?: string;
+  country?: string;
+  website?: string;
+  gstin?: string;
+  sourceTier?: number;
+  sourceUrl?: string;
+  urlClassification: UrlClassification;
+  contactStatus: ContactStatus;
+  enrichmentStatus?: string;
+  enrichmentError?: string;
+  businessType?: string | null;
+  products: string[];
+  productCategories: string[];
+  certifications: string[];
+  manufacturingCapabilities: string[];
+  fieldConfidence?: Record<string, number>;
+  extractionMetadata?: Record<string, unknown>;
+  normalizedName: string;
+  normalizedPhone?: string;
+  domain?: string;
+}
 
 @Injectable()
 export class SupplierSearchService {
@@ -19,77 +62,218 @@ export class SupplierSearchService {
     private readonly aiService: AiService,
     private readonly suppliersService: SuppliersService,
     private readonly externalSourceService: ExternalSourceService,
+    private readonly supplierEnrichmentService: SupplierEnrichmentService,
   ) {}
 
   /**
    * Implements the full flow:
-   * requirement -> extract criteria -> search DB -> good matches? -> rank & return
-   *                                                -> else automated discovery -> normalize/dedupe/verify -> rank -> save -> return
+   * requirement -> extract criteria -> search DB (capability-matching table) -> good matches?
+   *   -> yes: rank & return immediately
+   *   -> no: create a discovery job, return it right away (pending) and run the tiered
+   *          discovery + normalize/dedupe/verify/rank pipeline in the background for polling.
    */
-  async search(prompt: string) {
+  async search(prompt: string, targetCount?: number, minScore?: number) {
     const criteria = await this.aiService.extractRequirement(prompt);
+    const effectiveTargetCount = targetCount ?? DEFAULT_TARGET_COUNT;
+    const effectiveMinScore = minScore ?? DEFAULT_MIN_SCORE;
 
     const internalMatches = await this.suppliersService.matchForRequirement(criteria);
-    const goodMatches = internalMatches.filter((m) => m.matchScore >= GOOD_MATCH_SCORE_THRESHOLD);
+    const goodMatches = internalMatches.filter((m) => m.matchScore >= effectiveMinScore);
 
-    if (goodMatches.length >= MIN_GOOD_MATCHES) {
-      const ranked = await this.aiService.rankSuppliersForRequirement(criteria, goodMatches);
+    if (goodMatches.length >= effectiveTargetCount) {
+      const ranked = this.dedupeBySupplierId(await this.aiService.rankSuppliersForRequirement(criteria, goodMatches));
+      await this.suppliersService.recordMatchResults(ranked, criteria as unknown as Record<string, unknown>);
       return { criteria, source: 'database' as const, suppliers: ranked, job: null };
     }
 
-    const job = await this.runDiscoveryJob(prompt, criteria, internalMatches);
-    return {
-      criteria,
-      source: 'discovery' as const,
-      suppliers: job.rankedSuppliers,
-      job: job.record,
-    };
-  }
-
-  /** Background-style discovery job (executed inline for MVP; safe to move to a queue worker later). */
-  private async runDiscoveryJob(
-    prompt: string,
-    criteria: SupplierRequirement,
-    fallbackMatches: { id: string; legalName: string; rating: number; categories?: { name: string }[] }[],
-  ) {
-    let record = this.jobRepo.create({
+    let job = this.jobRepo.create({
       promptText: prompt,
       criteria: criteria as unknown as Record<string, unknown>,
-      status: DiscoveryJobStatus.RUNNING,
+      status: DiscoveryJobStatus.PENDING,
+      targetCount: effectiveTargetCount,
+      minScore: effectiveMinScore,
+      progressStage: 'queued',
+      progressMessage: '🔍 Finding additional suppliers...',
     });
-    record = await this.jobRepo.save(record);
+    job = await this.jobRepo.save(job);
+
+    // Fire-and-forget: the frontend polls GET /suppliers/search/jobs/:id for progress/results.
+    void this.runDiscoveryJob(job.id, criteria, internalMatches).catch((err) =>
+      this.logger.error('Unhandled discovery job failure', err as Error),
+    );
+
+    const fallbackRanked = this.dedupeBySupplierId(
+      await this.aiService.rankSuppliersForRequirement(criteria, internalMatches),
+    );
+    // Persist the immediate ranking right away (not just after the background job completes),
+    // so partial results are already visible/queryable in the Suppliers tab while discovery runs.
+    await this.suppliersService.recordMatchResults(fallbackRanked, criteria as unknown as Record<string, unknown>);
+    return { criteria, source: 'discovery-pending' as const, suppliers: fallbackRanked, job };
+  }
+
+  /** Guards against the same supplier appearing twice in a ranked result set before it's persisted/returned. */
+  private dedupeBySupplierId(suggestions: SupplierSuggestion[]) {
+    const seen = new Set<string>();
+    return suggestions.filter((s) => (seen.has(s.supplierId) ? false : (seen.add(s.supplierId), true)));
+  }
+
+  /** Runs the discovery pipeline in the background, persisting progress for polling clients. */
+  private async runDiscoveryJob(
+    jobId: string,
+    criteria: SupplierRequirement,
+    fallbackMatches: {
+      id: string;
+      legalName: string;
+      rating: number;
+      categories?: { name: string }[];
+      city?: string;
+      state?: string;
+    }[],
+  ) {
+    let record = (await this.jobRepo.findOne({ where: { id: jobId } }))!;
+    record.status = DiscoveryJobStatus.RUNNING;
+    record = await this.updateProgress(record, 'generating_queries', '🔍 Generating search queries...');
 
     try {
-      // AI generates multiple search queries
       const queries = await this.aiService.generateSearchQueries(criteria);
       record.queries = queries;
-      await this.jobRepo.save(record);
+      record = await this.updateProgress(record, 'searching', '🔍 Searching licensed APIs, open data and official sites...');
 
-      // Search external sources (APIs / open data / official supplier sites via configured connector)
-      const rawResults = await this.externalSourceService.searchMany(queries);
+      // Priority 1, 3, 4: external tiered sourcing (licensed API -> open data -> official sites).
+      const { results: externalResults, tiersUsed } = await this.externalSourceService.searchTiered(
+        queries,
+        record.targetCount,
+      );
+      record.tiersUsed = tiersUsed;
+      record = await this.updateProgress(
+        record,
+        'tier2_semantic',
+        '🔍 Checking previously-discovered suppliers for a semantic match...',
+      );
 
-      // Normalize
-      const normalized = this.normalize(rawResults);
+      // Priority 2: semantic/vector similarity search over previously-discovered-but-unmatched suppliers.
+      const semanticText = [criteria.product, criteria.specifications, criteria.location]
+        .filter(Boolean)
+        .join(' ');
+      const embedding = await this.aiService.generateEmbedding(semanticText);
+      const semanticMatches = await this.suppliersService.findUnmatchedForSemanticSearch(embedding, 20);
+      const semanticAsRaw: RawSupplierResult[] = semanticMatches
+        .filter((s) => s.matchScore >= 60)
+        .map((s) => ({
+          legalName: s.legalName,
+          email: s.email,
+          phone: s.phone,
+          city: s.city,
+          state: s.state,
+          website: s.website,
+          gstin: s.taxId,
+          sourceTier: 2,
+        }));
 
-      // Remove duplicates (within batch + against existing DB)
-      const deduped = this.dedupe(normalized);
-      const existing = await this.suppliersService.existingEmails(deduped.map((r) => r.email));
-      const newOnes = deduped.filter((r) => !existing.has(r.email.toLowerCase()));
+      record = await this.updateProgress(record, 'collecting_results', '🔍 Collecting candidate supplier leads...');
+      // Performance cap: never enrich/verify more than MAX_CANDIDATES_PER_JOB leads for one search.
+      const allLeads = [...externalResults, ...semanticAsRaw].slice(0, MAX_CANDIDATES_PER_JOB);
 
-      // Verify basic business details (has name, valid-looking email/phone)
-      const verified = newOnes.filter((r) => this.basicVerify(r));
+      record = await this.updateProgress(record, 'classifying_urls', '🔍 Classifying supplier lead URLs...');
+      const candidates = await this.classifyAndEnrichLeads(allLeads);
 
-      // Save qualified/temporary supplier profiles to the DB, tagged pending_verification
+      record = await this.updateProgress(record, 'normalizing', '🔍 Normalizing candidate profiles...');
+      const normalized = this.normalize(candidates);
+      record = await this.updateProgress(record, 'deduping', '🔍 Removing duplicates...');
+
+      const { deduped, confidenceByItem } = this.dedupeWithConfidence(normalized);
+      const existingInDb = await this.suppliersService.findExistingForDedupe(
+        deduped.map((r) => ({ email: r.email, gstin: r.gstin, phone: r.normalizedPhone, website: r.website })),
+      );
+      const existingKeys = new Set(
+        existingInDb.flatMap((s) =>
+          [s.email?.toLowerCase(), s.taxId, s.phone].filter((v): v is string => !!v),
+        ),
+      );
+      const newOnes = deduped.filter(
+        (r) =>
+          !(r.email && existingKeys.has(r.email.toLowerCase())) &&
+          !(r.gstin && existingKeys.has(r.gstin)) &&
+          !(r.normalizedPhone && existingKeys.has(r.normalizedPhone)),
+      );
+
+      // Exact-match dedupe above can miss the same real-world company re-discovered under a
+      // different domain/lead (especially now that missing emails are null, not a unique
+      // placeholder). Catch those via fuzzy name+location similarity against known suppliers.
+      const knownForFuzzyDedupe = [...existingInDb, ...fallbackMatches];
+      const newOnesDeduped = newOnes.filter((r) => {
+        const normalizedIncoming = normalizeCompanyName(r.legalName);
+        return !knownForFuzzyDedupe.some((existing) => {
+          const nameSimilarity = stringSimilarity(normalizedIncoming, normalizeCompanyName(existing.legalName));
+          const addressMatch =
+            (r.city && existing.city && r.city === existing.city) ||
+            (r.state && existing.state && r.state === existing.state);
+          return nameSimilarity >= DEDUPE_CONFIDENCE_THRESHOLD && addressMatch;
+        });
+      });
+
+      record = await this.updateProgress(record, 'verifying', '🔍 Verifying business details...');
+
+      // Tiered verification status: verified / verification_pending / partially_verified / unverified.
+      const verifiedCandidates = await Promise.all(
+        newOnesDeduped.map(async (r) => ({
+          raw: r,
+          verificationStatus: await this.computeVerificationStatus(r),
+        })),
+      );
+      // Data quality filter: a lead must at least have a company name plus a website OR another
+      // identifiable business source (GSTIN/email/phone) - irrelevant/undiscoverable leads are dropped.
+      const qualified = verifiedCandidates.filter((v) => this.passesMinimumQuality(v.raw));
+
+      record = await this.updateProgress(record, 'saving', '🔍 Saving qualified profiles for review...');
+
       const categoryNames = criteria.product ? [criteria.product] : [];
-      const created = await this.suppliersService.bulkCreateDiscovered(verified, categoryNames);
+      const created = await this.suppliersService.bulkCreateDiscovered(
+        qualified.map((v) => ({
+          legalName: v.raw.legalName,
+          email: v.raw.email,
+          phone: v.raw.phone,
+          address: v.raw.address,
+          city: v.raw.city,
+          state: v.raw.state,
+          country: v.raw.country,
+          website: v.raw.website,
+          gstin: v.raw.gstin,
+          contactStatus: v.raw.contactStatus,
+          verificationStatus: v.verificationStatus,
+          discoveryConfidence: confidenceByItem.get(v.raw) ?? 100,
+          sourceTier: v.raw.sourceTier,
+          discoverySourceUrl: v.raw.sourceUrl,
+          sourceType: v.raw.urlClassification,
+          enrichmentStatus: v.raw.enrichmentStatus,
+          enrichmentError: v.raw.enrichmentError,
+          businessType: v.raw.businessType,
+          products: v.raw.products,
+          productCategories: v.raw.productCategories,
+          certifications: v.raw.certifications,
+          manufacturingCapabilities: v.raw.manufacturingCapabilities,
+          fieldConfidence: v.raw.fieldConfidence,
+          extractionMetadata: v.raw.extractionMetadata,
+        })),
+        categoryNames,
+      );
 
-      // Match & rank (product/quantity/location match already applied via query generation + verify step)
+      record = await this.updateProgress(record, 'ranking', '🔍 Ranking candidates against your requirement...');
+
+      // Rank (product/quantity/location/verification/past-performance via the capability-matching table).
       const combinedCandidates = [...fallbackMatches, ...created.map((s) => ({ ...s, matchScore: 0 }))];
-      const ranked = await this.aiService.rankSuppliersForRequirement(criteria, combinedCandidates);
+      const ranked = this.dedupeBySupplierId(
+        await this.aiService.rankSuppliersForRequirement(criteria, combinedCandidates),
+      );
+      await this.suppliersService.recordMatchResults(ranked, criteria as unknown as Record<string, unknown>);
 
       record.status = DiscoveryJobStatus.COMPLETED;
       record.discoveredCount = normalized.length;
       record.qualifiedCount = created.length;
+      record.progressStage = 'done';
+      record.progressMessage = `✅ Found ${created.length} new qualified supplier(s).`;
+      record.finalResults = ranked;
+      record.resultsPreview = ranked;
       record = await this.jobRepo.save(record);
 
       return { record, rankedSuppliers: ranked };
@@ -97,41 +281,205 @@ export class SupplierSearchService {
       this.logger.error('Discovery job failed', err as Error);
       record.status = DiscoveryJobStatus.FAILED;
       record.errorMessage = (err as Error).message;
-      record = await this.jobRepo.save(record);
+      record.progressStage = 'failed';
+      record.progressMessage = '❌ Discovery job failed.';
 
-      // Still return whatever we had from the database as a fallback.
-      const ranked = await this.aiService.rankSuppliersForRequirement(criteria, fallbackMatches);
+      const ranked = this.dedupeBySupplierId(
+        await this.aiService.rankSuppliersForRequirement(criteria, fallbackMatches),
+      );
+      record.finalResults = ranked;
+      record = await this.jobRepo.save(record);
       return { record, rankedSuppliers: ranked };
     }
   }
 
-  private normalize(raw: RawSupplierResult[]): RawSupplierResult[] {
-    return raw
-      .filter((r) => r.legalName && r.email)
-      .map((r) => ({
-        legalName: r.legalName.trim(),
-        email: r.email.trim().toLowerCase(),
-        phone: r.phone?.trim(),
-        city: r.city?.trim(),
-        state: r.state?.trim(),
-        website: r.website?.trim(),
-      }));
+  private async updateProgress(record: DiscoveryJob, stage: string, message: string): Promise<DiscoveryJob> {
+    record.progressStage = stage;
+    record.progressMessage = message;
+    return this.jobRepo.save(record);
   }
 
-  private dedupe(raw: RawSupplierResult[]): RawSupplierResult[] {
-    const seen = new Set<string>();
-    const result: RawSupplierResult[] = [];
-    for (const r of raw) {
-      if (seen.has(r.email)) continue;
-      seen.add(r.email);
-      result.push(r);
+  /**
+   * Classifies each lead's URL and, for official-website leads, runs it through
+   * SupplierEnrichmentService (fetch -> structured extraction -> AI profile). Leads pointing at
+   * marketplaces/directories/government/social sites are kept as-is (never scraped directly) using
+   * whatever contact data the source tier already supplied. One supplier's enrichment failure never
+   * aborts the batch - it's simply marked enrichment_failed and processing continues.
+   */
+  private async classifyAndEnrichLeads(leads: RawSupplierResult[]): Promise<SupplierCandidate[]> {
+    return Promise.all(
+      leads.map(async (lead) => {
+        try {
+          const { candidate } = await this.supplierEnrichmentService.enrichLead(lead);
+          return candidate;
+        } catch (err) {
+          this.logger.warn(`Unexpected enrichment error for ${lead.website ?? lead.legalName}`, err as Error);
+          const classification = classifyUrl(lead.website);
+          return {
+            legalName: lead.legalName ?? null,
+            website: lead.website ?? '',
+            email: lead.email ?? null,
+            phone: lead.phone ?? null,
+            address: null,
+            city: lead.city ?? null,
+            state: lead.state ?? null,
+            country: null,
+            businessType: null,
+            products: [],
+            productCategories: [],
+            certifications: [],
+            manufacturingCapabilities: [],
+            extractionMetadata: { legalNameSource: null, emailSource: null, phoneSource: null, addressSource: null },
+            fieldConfidence: { legalName: 0, email: 0, phone: 0, address: 0, products: 0 },
+            sourceUrl: lead.website ?? '',
+            urlClassification: classification,
+            contactStatus: lead.email && lead.phone ? 'available' : lead.email || lead.phone ? 'partial' : 'missing',
+            enrichmentStatus: 'failed',
+            enrichmentError: (err as Error).message,
+            gstin: lead.gstin,
+            sourceTier: lead.sourceTier,
+          } satisfies SupplierCandidate;
+        }
+      }),
+    );
+  }
+
+  private normalize(candidates: SupplierCandidate[]): NormalizedResult[] {
+    return candidates
+      // Data quality filter: news/blog/job/irrelevant pages never become supplier candidates.
+      .filter((c) => c.urlClassification !== 'irrelevant')
+      .filter((c) => c.legalName && (c.website || c.email || c.phone || c.gstin))
+      .map((c) => {
+        const domain = extractDomain(c.website);
+        return {
+          legalName: c.legalName!.trim(),
+          email: c.email ? c.email.trim().toLowerCase() : null,
+          phone: c.phone?.trim(),
+          address: c.address?.trim(),
+          city: c.city?.trim(),
+          state: c.state?.trim(),
+          country: c.country?.trim(),
+          website: c.website?.trim(),
+          gstin: c.gstin?.trim().toUpperCase(),
+          sourceTier: c.sourceTier,
+          sourceUrl: c.sourceUrl,
+          urlClassification: c.urlClassification,
+          contactStatus: c.contactStatus,
+          enrichmentStatus: c.enrichmentStatus,
+          enrichmentError: c.enrichmentError,
+          businessType: c.businessType,
+          products: c.products ?? [],
+          productCategories: c.productCategories ?? [],
+          certifications: c.certifications ?? [],
+          manufacturingCapabilities: c.manufacturingCapabilities ?? [],
+          fieldConfidence: c.fieldConfidence as unknown as Record<string, number>,
+          extractionMetadata: c.extractionMetadata as unknown as Record<string, unknown>,
+          normalizedName: normalizeCompanyName(c.legalName!),
+          normalizedPhone: normalizePhone(c.phone ?? undefined),
+          domain,
+        };
+      });
+  }
+
+  /**
+   * Dedupes by GSTIN / website domain / phone / name+address similarity, assigning a confidence
+   * score (0-100) per surviving record based on the strongest signal that matched a duplicate.
+   * Keyed by object identity (not email, which may now be null for multiple records) to avoid
+   * key collisions.
+   */
+  private dedupeWithConfidence(items: NormalizedResult[]): {
+    deduped: NormalizedResult[];
+    confidenceByItem: Map<NormalizedResult, number>;
+  } {
+    const kept: NormalizedResult[] = [];
+    const confidenceByItem = new Map<NormalizedResult, number>();
+
+    for (const item of items) {
+      let matchIndex = -1;
+      let matchConfidence = 0;
+
+      for (let i = 0; i < kept.length; i++) {
+        const other = kept[i];
+        let confidence = 0;
+        if (item.gstin && other.gstin && item.gstin === other.gstin) {
+          confidence = Math.max(confidence, 100);
+        }
+        if (item.domain && other.domain && item.domain === other.domain) {
+          confidence = Math.max(confidence, 90);
+        }
+        if (item.normalizedPhone && other.normalizedPhone && item.normalizedPhone === other.normalizedPhone) {
+          confidence = Math.max(confidence, 85);
+        }
+        const nameSimilarity = stringSimilarity(item.normalizedName, other.normalizedName);
+        const addressMatch = (item.city && item.city === other.city) || (item.state && item.state === other.state);
+        if (nameSimilarity >= DEDUPE_CONFIDENCE_THRESHOLD && addressMatch) {
+          confidence = Math.max(confidence, Math.round(nameSimilarity * 80));
+        }
+
+        if (confidence > matchConfidence) {
+          matchConfidence = confidence;
+          matchIndex = i;
+        }
+      }
+
+      if (matchIndex >= 0 && matchConfidence >= 70) {
+        confidenceByItem.set(kept[matchIndex], matchConfidence);
+        continue; // duplicate of an already-kept record
+      }
+
+      kept.push(item);
+      confidenceByItem.set(item, 100);
     }
-    return result;
+
+    return { deduped: kept, confidenceByItem };
   }
 
-  private basicVerify(r: RawSupplierResult): boolean {
-    const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(r.email);
-    return Boolean(r.legalName && emailValid);
+  /**
+   * Separates identity signals (name/website/email/phone/address/GSTIN found) from an overall
+   * verification status, so a supplier is never marked "verified" just because its website loads:
+   *  - verified: reachable official site + valid GSTIN + phone
+   *  - verification_pending: good profile (name+website+contact/location+product info) but no GSTIN yet
+   *  - partially_verified: name + official website + at least one contact/location signal
+   *  - unverified: little else is known
+   */
+  private async computeVerificationStatus(r: NormalizedResult): Promise<SupplierVerificationStatus> {
+    const hasName = !!r.legalName;
+    const emailValid = !!r.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(r.email);
+    const phonePresent = !!r.normalizedPhone && r.normalizedPhone.length === 10;
+    const hasAddress = !!(r.address || r.city || r.state);
+    const gstinValid = isValidGstin(r.gstin);
+    const hasProfile = r.products.length > 0 || r.certifications.length > 0 || r.manufacturingCapabilities.length > 0;
+    const websiteReachable = r.enrichmentStatus === 'enriched' ? true : await this.isWebsiteReachable(r.website);
+
+    if (websiteReachable && gstinValid && phonePresent) {
+      return SupplierVerificationStatus.VERIFIED;
+    }
+    if (hasName && websiteReachable && (emailValid || phonePresent || hasAddress) && hasProfile) {
+      return SupplierVerificationStatus.VERIFICATION_PENDING;
+    }
+    if (hasName && websiteReachable && (emailValid || phonePresent || hasAddress)) {
+      return SupplierVerificationStatus.PARTIALLY_VERIFIED;
+    }
+    return SupplierVerificationStatus.UNVERIFIED;
+  }
+
+  private async isWebsiteReachable(website?: string): Promise<boolean> {
+    if (!website) return false;
+    try {
+      const url = website.startsWith('http') ? website : `https://${website}`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
+      clearTimeout(timeout);
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Minimum bar to persist a discovered lead at all: a company name plus some identifiable source. */
+  private passesMinimumQuality(r: NormalizedResult): boolean {
+    return !!r.legalName && !!(r.website || r.gstin || r.email || r.phone);
   }
 
   async getJob(id: string): Promise<DiscoveryJob | null> {

@@ -2,9 +2,11 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, ILike, In } from 'typeorm';
 import { parse } from 'csv-parse/sync';
-import { Supplier, SupplierSource, SupplierStatus } from './entities/supplier.entity';
+import { Supplier, SupplierSource, SupplierStatus, SupplierVerificationStatus } from './entities/supplier.entity';
 import { SupplierCategory } from './entities/supplier-category.entity';
 import { CreateSupplierDto, SearchSupplierDto } from './dto/supplier.dto';
+import { scoreCapabilityMatch, ScorableCriteria } from '../common/utils/capability-scoring.util';
+import { cosineSimilarity } from '../common/utils/normalization.util';
 
 @Injectable()
 export class SuppliersService {
@@ -94,7 +96,10 @@ export class SuppliersService {
       .leftJoinAndSelect('supplier.categories', 'category')
       .skip((page - 1) * pageSize)
       .take(pageSize)
-      .orderBy('supplier.rating', 'DESC');
+      // Surface the most recently AI/heuristic-ranked suppliers first so search results are
+      // immediately visible here, falling back to rating for suppliers never ranked yet.
+      .orderBy('supplier.lastMatchedAt', 'DESC', 'NULLS LAST')
+      .addOrderBy('supplier.rating', 'DESC');
 
     if (dto.q) {
       qb.andWhere(
@@ -125,8 +130,50 @@ export class SuppliersService {
     return supplier;
   }
 
+  /** Sanitized public profile - omits email/phone/contact details. */
+  async publicProfile(id: string) {
+    const s = await this.findOne(id);
+    return {
+      id: s.id,
+      legalName: s.legalName,
+      tradeName: s.tradeName,
+      city: s.city,
+      state: s.state,
+      country: s.country,
+      website: s.website,
+      logoUrl: s.logoUrl,
+      description: s.description,
+      categories: s.categories,
+      rating: s.rating,
+      verificationStatus: s.verificationStatus,
+    };
+  }
+
   async findByIds(ids: string[]): Promise<Supplier[]> {
     return this.supplierRepo.find({ where: { id: In(ids) } });
+  }
+
+  /** Persists the AI/heuristic ranking result onto each matched supplier for later review/audit. */
+  async recordMatchResults(
+    results: { supplierId: string; score: number; reason: string }[],
+    criteria: Record<string, unknown>,
+  ): Promise<void> {
+    if (!results.length) return;
+    const now = new Date();
+    await Promise.all(
+      results.map((r) =>
+        this.supplierRepo.update(
+          { id: r.supplierId },
+          {
+            lastMatchScore: r.score,
+            lastMatchReason: r.reason,
+            // TypeORM's QueryDeepPartialEntity can't infer a plain Record<string, unknown> for jsonb columns.
+            lastMatchCriteria: criteria as unknown as () => string,
+            lastMatchedAt: now,
+          },
+        ),
+      ),
+    );
   }
 
   async updateStatus(id: string, status: SupplierStatus): Promise<Supplier> {
@@ -139,11 +186,10 @@ export class SuppliersService {
     return this.categoryRepo.find({ order: { name: 'ASC' } });
   }
 
-  /** Matches suppliers already in the DB against an AI-extracted requirement (product/location match + rating). */
-  async matchForRequirement(criteria: {
-    product: string;
-    location?: string;
-  }): Promise<(Supplier & { matchScore: number })[]> {
+  /** Matches suppliers already in the DB against an AI-extracted requirement, scored via the capability table. */
+  async matchForRequirement(
+    criteria: ScorableCriteria,
+  ): Promise<(Supplier & { matchScore: number; capabilityBreakdown: ReturnType<typeof scoreCapabilityMatch> })[]> {
     const qb = this.supplierRepo
       .createQueryBuilder('supplier')
       .leftJoinAndSelect('supplier.categories', 'category')
@@ -164,15 +210,8 @@ export class SuppliersService {
     const suppliers = await qb.orderBy('supplier.rating', 'DESC').limit(50).getMany();
 
     return suppliers.map((s) => {
-      const categoryMatch = s.categories?.some((c) =>
-        c.name.toLowerCase().includes(criteria.product.toLowerCase()),
-      );
-      const locationMatch =
-        !!criteria.location &&
-        (s.city?.toLowerCase().includes(criteria.location.toLowerCase()) ||
-          s.state?.toLowerCase().includes(criteria.location.toLowerCase()));
-      const matchScore = (s.rating ?? 0) * 0.6 + (categoryMatch ? 3 : 0) + (locationMatch ? 2 : 0);
-      return { ...s, matchScore: Number(matchScore.toFixed(2)) };
+      const capabilityBreakdown = scoreCapabilityMatch(criteria, s);
+      return { ...s, matchScore: capabilityBreakdown.total, capabilityBreakdown };
     });
   }
 
@@ -180,26 +219,119 @@ export class SuppliersService {
   async existingEmails(emails: string[]): Promise<Set<string>> {
     if (!emails.length) return new Set();
     const rows = await this.supplierRepo.find({ where: { email: In(emails) }, select: ['email'] });
-    return new Set(rows.map((r) => r.email.toLowerCase()));
+    return new Set(rows.map((r) => (r.email ?? '').toLowerCase()).filter(Boolean));
+  }
+
+  /**
+   * Finds existing suppliers that may be duplicates of the given discovery candidates, matched via
+   * GSTIN, website domain, phone or email (used for confidence-scored dedupe against the DB).
+   */
+  async findExistingForDedupe(
+    candidates: { email?: string | null; gstin?: string; phone?: string; website?: string }[],
+  ): Promise<Supplier[]> {
+    if (!candidates.length) return [];
+    const emails = candidates.map((c) => c.email?.toLowerCase()).filter((v): v is string => !!v);
+    const gstins = candidates.map((c) => c.gstin).filter((v): v is string => !!v);
+    const phones = candidates.map((c) => c.phone).filter((v): v is string => !!v);
+
+    if (!emails.length && !gstins.length && !phones.length) return [];
+
+    const qb = this.supplierRepo.createQueryBuilder('supplier');
+    qb.where('1 = 0');
+    if (emails.length) qb.orWhere('LOWER(supplier.email) IN (:...emails)', { emails });
+    if (gstins.length) qb.orWhere('supplier.taxId IN (:...gstins)', { gstins });
+    if (phones.length) qb.orWhere('supplier.phone IN (:...phones)', { phones });
+
+    return qb.getMany();
+  }
+
+  /**
+   * Priority-2 external source: semantic/vector similarity search over previously-discovered-but-
+   * unmatched suppliers (status=pending_verification) using cosine similarity over stored embeddings.
+   */
+  async findUnmatchedForSemanticSearch(
+    embedding: number[],
+    limit = 20,
+  ): Promise<(Supplier & { matchScore: number })[]> {
+    const candidates = await this.supplierRepo.find({
+      where: { status: SupplierStatus.PENDING_VERIFICATION },
+      relations: ['categories'],
+      take: 500,
+    });
+
+    return candidates
+      .filter((c) => Array.isArray(c.embedding) && c.embedding.length)
+      .map((c) => ({ ...c, matchScore: Number((cosineSimilarity(embedding, c.embedding!) * 100).toFixed(2)) }))
+      .sort((a, b) => b.matchScore - a.matchScore)
+      .slice(0, limit);
   }
 
   /** Bulk-creates suppliers found via automated discovery, tagged for manual verification. */
   async bulkCreateDiscovered(
-    raw: { legalName: string; email: string; phone?: string; city?: string; state?: string }[],
+    raw: {
+      legalName: string;
+      email?: string | null;
+      phone?: string | null;
+      address?: string | null;
+      city?: string | null;
+      state?: string | null;
+      country?: string | null;
+      website?: string;
+      gstin?: string;
+      contactStatus?: 'available' | 'partial' | 'missing';
+      verificationStatus?: SupplierVerificationStatus;
+      discoveryConfidence?: number;
+      sourceTier?: number;
+      discoverySourceUrl?: string;
+      sourceType?: string;
+      enrichmentStatus?: string;
+      enrichmentError?: string;
+      businessType?: string | null;
+      products?: string[];
+      productCategories?: string[];
+      certifications?: string[];
+      manufacturingCapabilities?: string[];
+      fieldConfidence?: Record<string, number>;
+      extractionMetadata?: Record<string, unknown>;
+      embedding?: number[];
+    }[],
     categoryNames: string[],
   ): Promise<Supplier[]> {
     if (!raw.length) return [];
     const categories = await this.resolveCategories(categoryNames);
-    const existing = await this.existingEmails(raw.map((r) => r.email));
-    const toCreate = raw.filter((r) => r.email && !existing.has(r.email.toLowerCase()));
+    const emailsToCheck = raw.map((r) => r.email).filter((v): v is string => !!v);
+    const existing = await this.existingEmails(emailsToCheck);
+    // Records with no email at all are never filtered here (nothing to dedupe against) - only
+    // an already-known real email blocks re-creation.
+    const toCreate = raw.filter((r) => !r.email || !existing.has(r.email.toLowerCase()));
 
     const suppliers = toCreate.map((r) =>
       this.supplierRepo.create({
         legalName: r.legalName,
-        email: r.email,
-        phone: r.phone,
-        city: r.city,
-        state: r.state,
+        email: r.email ?? undefined,
+        phone: r.phone ?? undefined,
+        address: r.address ?? undefined,
+        city: r.city ?? undefined,
+        state: r.state ?? undefined,
+        country: r.country ?? undefined,
+        website: r.website,
+        taxId: r.gstin,
+        contactStatus: r.contactStatus ?? 'missing',
+        verificationStatus: r.verificationStatus ?? SupplierVerificationStatus.UNVERIFIED,
+        discoveryConfidence: r.discoveryConfidence,
+        sourceTier: r.sourceTier,
+        discoverySourceUrl: r.discoverySourceUrl,
+        sourceType: r.sourceType,
+        enrichmentStatus: r.enrichmentStatus,
+        enrichmentError: r.enrichmentError,
+        businessType: r.businessType ?? undefined,
+        products: r.products,
+        productCategories: r.productCategories,
+        certifications: r.certifications,
+        manufacturingCapabilities: r.manufacturingCapabilities,
+        fieldConfidence: r.fieldConfidence,
+        extractionMetadata: r.extractionMetadata,
+        embedding: r.embedding,
         categories,
         source: SupplierSource.DISCOVERED,
         status: SupplierStatus.PENDING_VERIFICATION,

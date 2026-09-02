@@ -3,13 +3,30 @@ import { apiClient } from './client';
 export interface Supplier {
   id: string;
   legalName: string;
+  tradeName?: string;
   email: string;
   phone?: string;
+  contactPerson?: string;
+  taxId?: string;
+  registrationNumber?: string;
   city?: string;
   state?: string;
+  country?: string;
+  website?: string;
+  description?: string;
+  certifications?: string[];
+  paymentTerms?: string;
   status: string;
+  source?: string;
+  verificationStatus?: string;
+  discoveryConfidence?: number;
+  sourceTier?: number;
   rating: number;
   categories: { id: string; name: string }[];
+  lastMatchScore?: number;
+  lastMatchReason?: string;
+  lastMatchCriteria?: Record<string, unknown>;
+  lastMatchedAt?: string;
 }
 
 export interface SearchParams {
@@ -24,6 +41,11 @@ export interface SearchParams {
 
 export async function searchSuppliers(params: SearchParams) {
   const { data } = await apiClient.get<{ data: Supplier[]; total: number }>('/suppliers', { params });
+  return data;
+}
+
+export async function getSupplier(id: string) {
+  const { data } = await apiClient.get<Supplier>(`/suppliers/${id}`);
   return data;
 }
 

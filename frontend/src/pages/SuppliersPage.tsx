@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Box,
   Button,
@@ -29,6 +30,43 @@ const columns: GridColDef<Supplier>[] = [
   { field: 'rating', headerName: 'Rating', flex: 0.4 },
   { field: 'status', headerName: 'Status', flex: 0.6 },
   {
+    field: 'source',
+    headerName: 'Source',
+    flex: 0.6,
+    renderCell: (params) =>
+      params.value ? <Chip label={(params.value as string).replace('_', ' ')} size="small" /> : null,
+  },
+  {
+    field: 'verificationStatus',
+    headerName: 'Verification',
+    flex: 0.7,
+    renderCell: (params) =>
+      params.value ? (
+        <Chip
+          label={(params.value as string).replace('_', ' ')}
+          size="small"
+          color={params.value === 'verified' ? 'success' : 'default'}
+        />
+      ) : null,
+  },
+  {
+    field: 'lastMatchScore',
+    headerName: 'Match Score',
+    flex: 0.5,
+    renderCell: (params) => (params.value != null ? <Chip label={params.value} color="primary" size="small" /> : null),
+  },
+  {
+    field: 'lastMatchReason',
+    headerName: 'Match Reason',
+    flex: 1.2,
+  },
+  {
+    field: 'lastMatchedAt',
+    headerName: 'Last Matched',
+    flex: 0.8,
+    valueFormatter: (value) => (value ? new Date(value as string).toLocaleString() : ''),
+  },
+  {
     field: 'categories',
     headerName: 'Categories',
     flex: 1,
@@ -43,7 +81,8 @@ const columns: GridColDef<Supplier>[] = [
 ];
 
 export function SuppliersPage() {
-  const [q, setQ] = useState('');
+  const [searchParams] = useSearchParams();
+  const [q, setQ] = useState(searchParams.get('q') ?? '');
   const [addOpen, setAddOpen] = useState(false);
   const [form, setForm] = useState({ legalName: '', email: '', city: '', state: '', categoryNames: '' });
   const fileInputRef = useRef<HTMLInputElement>(null);

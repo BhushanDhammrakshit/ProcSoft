@@ -67,6 +67,9 @@ export class MailingService {
 
     for (const recipient of campaign.recipients) {
       try {
+        if (!recipient.supplier.email) {
+          throw new Error('Supplier has no verified email on file (contactStatus is not "available")');
+        }
         let body = this.renderTemplate(campaign.bodyTemplate, recipient.supplier);
         if (campaign.useAiPersonalization) {
           body = await this.aiService.draftSupplierEmail({

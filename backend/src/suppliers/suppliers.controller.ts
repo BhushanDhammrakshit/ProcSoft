@@ -44,6 +44,11 @@ export class SuppliersController {
     return this.suppliersService.findOne(id);
   }
 
+  @Get(':id/public')
+  publicProfile(@Param('id') id: string) {
+    return this.suppliersService.publicProfile(id);
+  }
+
   @Patch(':id/status')
   updateStatus(@Param('id') id: string, @Body('status') status: SupplierStatus) {
     return this.suppliersService.updateStatus(id, status);
