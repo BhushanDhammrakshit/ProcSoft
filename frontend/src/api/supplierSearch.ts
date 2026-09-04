@@ -40,16 +40,25 @@ export interface DiscoveryJob {
 
 export interface AiSupplierSearchResult {
   criteria: SupplierRequirement;
-  source: 'database' | 'discovery-pending';
+  source: 'database' | 'discovery-pending' | 'location-required';
   suppliers: SupplierSuggestion[];
   job: DiscoveryJob | null;
 }
 
-export async function searchSuppliersWithAi(prompt: string, targetCount?: number, minScore?: number) {
+export async function searchSuppliersWithAi(
+  prompt: string,
+  targetCount?: number,
+  minScore?: number,
+  coords?: { latitude: number; longitude: number },
+  locationOverride?: string,
+) {
   const { data } = await apiClient.post<AiSupplierSearchResult>('/suppliers/search/ai', {
     prompt,
     targetCount,
     minScore,
+    latitude: coords?.latitude,
+    longitude: coords?.longitude,
+    locationOverride,
   });
   return data;
 }

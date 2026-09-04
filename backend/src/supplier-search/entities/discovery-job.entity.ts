@@ -35,7 +35,7 @@ export class DiscoveryJob extends BaseEntity {
   @Column({ name: 'progress_message', nullable: true })
   progressMessage?: string;
 
-  // Priority tiers (1=licensed API, 2=internal semantic, 3=open data, 4=official sites) that yielded results.
+  // Priority tiers (1=Google Places, 2=licensed API, 3=internal semantic, 4=open data, 5=general web search) that yielded results.
   @Column({ name: 'tiers_used', type: 'jsonb', nullable: true })
   tiersUsed?: number[];
 

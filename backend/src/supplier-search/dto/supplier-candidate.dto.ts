@@ -10,6 +10,7 @@ export interface ExtractionMetadata {
   emailSource: 'mailto' | 'json_ld' | 'text' | null;
   phoneSource: 'tel' | 'json_ld' | 'text' | null;
   addressSource: 'json_ld' | 'text' | null;
+  gstinSource?: 'json_ld' | 'text_keyword' | 'text_pattern' | null;
 }
 
 export interface FieldConfidence {
@@ -18,6 +19,7 @@ export interface FieldConfidence {
   phone: number;
   address: number;
   products: number;
+  gstin?: number;
 }
 
 /**

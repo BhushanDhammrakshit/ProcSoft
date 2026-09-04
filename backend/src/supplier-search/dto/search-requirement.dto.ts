@@ -1,4 +1,4 @@
-import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsInt, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 
 export class SearchRequirementDto {
@@ -19,6 +19,24 @@ export class SearchRequirementDto {
   @Min(0)
   @Max(100)
   minScore?: number;
+
+  /** Requester's own browser geolocation - only used as a soft Google Places bias when the
+   * prompt itself doesn't mention a location (explicit prompt location always takes priority). */
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  latitude?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  longitude?: number;
+
+  /** Manual location typed by the user in the "location required" popup, used when browser
+   * geolocation is unavailable/denied and the prompt itself has no location mention. */
+  @IsOptional()
+  @IsString()
+  locationOverride?: string;
 }
 
 export interface RawSupplierResult {
@@ -31,6 +49,6 @@ export interface RawSupplierResult {
   state?: string;
   website?: string;
   gstin?: string;
-  // Priority tier that produced this raw result (1=licensed API, 2=internal semantic, 3=open data, 4=official sites).
+  // Priority tier that produced this raw result (1=Google Places, 2=licensed API, 3=internal semantic, 4=open data, 5=general web search).
   sourceTier?: number;
 }

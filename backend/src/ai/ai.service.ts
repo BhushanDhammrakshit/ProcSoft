@@ -346,6 +346,8 @@ export class AiService {
             role: 'system',
             content:
               'You are a procurement analyst re-ranking candidate suppliers for a buyer requirement. ' +
+              'Weigh criteria.location against each candidate\'s city/state - penalize suppliers outside ' +
+              'the requested geography relative to ones inside it. ' +
               'Return JSON {"suggestions": [{supplierId, legalName, score, reason}]}, keep supplierId unchanged.',
           },
           {
@@ -357,6 +359,8 @@ export class AiService {
                 legalName,
                 score,
                 reason,
+                city: contactById.get(supplierId)?.city,
+                state: contactById.get(supplierId)?.state,
               })),
             }),
           },

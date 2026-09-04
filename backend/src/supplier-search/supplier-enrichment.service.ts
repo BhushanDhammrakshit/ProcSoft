@@ -13,6 +13,7 @@ import {
   extractAddress,
   extractCompanyName,
   extractEmail,
+  extractGstin,
   extractJsonLd,
   extractPhone,
   stripHtmlToText,
@@ -108,17 +109,41 @@ export class SupplierEnrichmentService {
 
   private async enrichOfficialWebsite(lead: RawSupplierResult, classification: UrlClassification): Promise<SupplierCandidate> {
     const homepageUrl = normalizeUrl(lead.website!);
-    const homepageHtml = await this.safeFetchHtml(homepageUrl);
+    let effectiveUrl = homepageUrl;
+    let homepageHtml = await this.safeFetchHtml(homepageUrl);
+    // Lead URLs from Google Places/GMB listings often carry tracking query params
+    // (?utm_source=...) that can make the exact URL fail (redirect quirks/bot detection) even
+    // though the plain page works fine - retry once with the query string stripped before
+    // giving up entirely.
+    if (!homepageHtml && new URL(homepageUrl).search) {
+      const strippedUrl = homepageUrl.split('?')[0];
+      const retryHtml = await this.safeFetchHtml(strippedUrl);
+      if (retryHtml) {
+        homepageHtml = retryHtml;
+        effectiveUrl = strippedUrl;
+      }
+    }
     if (!homepageHtml) {
       return this.buildLeadOnlyCandidate(lead, classification, 'failed', 'homepage unreachable');
     }
 
-    const links = discoverInternalLinks(homepageHtml, homepageUrl).slice(0, Math.max(0, MAX_PAGES_PER_SUPPLIER - 1));
+    const links = discoverInternalLinks(homepageHtml, effectiveUrl).slice(0, Math.max(0, MAX_PAGES_PER_SUPPLIER - 1));
     const fetchedPages = await Promise.all(
       links.map((link) => this.pageLimiter.run(async () => ({ url: link.url, html: await this.safeFetchHtml(link.url) }))),
     );
 
-    const pages = [{ url: homepageUrl, html: homepageHtml }, ...fetchedPages.filter((p) => !!p.html)] as {
+    // The lead URL is sometimes a deep page (e.g. a blog/buying-guide article) rather than the
+    // site's homepage - its own footer/contact info can be thinner or JS-rendered there, whereas
+    // the domain root almost always carries the real contact footer. Fetch it too when it wasn't
+    // already discovered/fetched above, spending one of the remaining page slots.
+    const rootUrl = new URL('/', effectiveUrl).toString();
+    let rootPage: { url: string; html: string | null } | null = null;
+    const alreadyHavePages = 1 + fetchedPages.length;
+    if (rootUrl !== effectiveUrl && !fetchedPages.some((p) => p.url === rootUrl) && alreadyHavePages < MAX_PAGES_PER_SUPPLIER) {
+      rootPage = await this.pageLimiter.run(async () => ({ url: rootUrl, html: await this.safeFetchHtml(rootUrl) }));
+    }
+
+    const pages = [{ url: effectiveUrl, html: homepageHtml }, ...fetchedPages.filter((p) => !!p.html), ...(rootPage?.html ? [rootPage] : [])] as {
       url: string;
       html: string;
     }[];
@@ -129,6 +154,7 @@ export class SupplierEnrichmentService {
     const emailField = this.firstNonNull(pages.map((p) => extractEmail(p.html, allJsonLd)));
     const phoneField = this.firstNonNull(pages.map((p) => extractPhone(p.html, allJsonLd)));
     const addressField = this.firstNonNull(pages.map((p) => extractAddress(p.html, allJsonLd)));
+    const gstinField = this.firstNonNull(pages.map((p) => extractGstin(p.html, allJsonLd)));
 
     const cleanedText = pages.map((p) => stripHtmlToText(p.html, 2500)).join('\n');
     const aiProfile = await this.aiService.extractSupplierProfile(cleanedText);
@@ -146,12 +172,13 @@ export class SupplierEnrichmentService {
     const city = addressField.value?.city ?? aiProfile.city ?? lead.city ?? null;
     const state = addressField.value?.state ?? aiProfile.state ?? lead.state ?? null;
     const country = addressField.value?.country ?? aiProfile.country ?? null;
+    const gstin = gstinField.value ?? lead.gstin ?? undefined;
 
-    this.logger.log(`Enriched ${homepageUrl}: name=${!!legalName} email=${!!email} phone=${!!phone}`);
+    this.logger.log(`Enriched ${effectiveUrl}: name=${!!legalName} email=${!!email} phone=${!!phone}`);
 
     return {
       legalName,
-      website: homepageUrl,
+      website: effectiveUrl,
       email,
       phone,
       address,
@@ -168,6 +195,7 @@ export class SupplierEnrichmentService {
         emailSource: (emailField.source as ExtractionMetadata['emailSource']) ?? null,
         phoneSource: (phoneField.source as ExtractionMetadata['phoneSource']) ?? null,
         addressSource: (addressField.source as ExtractionMetadata['addressSource']) ?? null,
+        gstinSource: (gstinField.source as ExtractionMetadata['gstinSource']) ?? null,
       },
       fieldConfidence: {
         legalName: nameField.confidence,
@@ -175,12 +203,13 @@ export class SupplierEnrichmentService {
         phone: phoneField.confidence,
         address: addressField.confidence,
         products: aiProfile.products.length ? 40 : 0,
+        gstin: gstinField.confidence,
       },
       sourceUrl: lead.website!,
       urlClassification: classification,
       contactStatus: contactStatusFor(email, phone),
       enrichmentStatus: 'enriched',
-      gstin: lead.gstin,
+      gstin,
       sourceTier: lead.sourceTier,
     };
   }

@@ -182,6 +182,49 @@ export class SuppliersService {
     return this.supplierRepo.save(supplier);
   }
 
+  /** Discovered suppliers with a website but missing email/phone/GSTIN - candidates for re-enrichment,
+   * best matches first so a limited re-enrichment run covers the results users actually see. */
+  async findMissingContactForReenrichment(limit: number): Promise<Supplier[]> {
+    return this.supplierRepo
+      .createQueryBuilder('supplier')
+      .where('supplier.website IS NOT NULL')
+      .andWhere('(supplier.email IS NULL OR supplier.phone IS NULL OR supplier.taxId IS NULL)')
+      .orderBy('supplier.lastMatchScore', 'DESC', 'NULLS LAST')
+      .addOrderBy('supplier.rating', 'DESC')
+      .take(limit)
+      .getMany();
+  }
+
+  /** Applies freshly re-enriched fields onto an existing supplier - only fills gaps, never
+   * overwrites a field that already has a real value. */
+  async applyEnrichmentPatch(
+    id: string,
+    patch: {
+      email?: string | null;
+      phone?: string | null;
+      address?: string | null;
+      city?: string | null;
+      state?: string | null;
+      country?: string | null;
+      gstin?: string | null;
+      enrichmentStatus?: string;
+    },
+  ): Promise<void> {
+    const supplier = await this.findOne(id);
+    if (!supplier.email && patch.email) supplier.email = patch.email;
+    if (!supplier.phone && patch.phone) supplier.phone = patch.phone;
+    if (!supplier.address && patch.address) supplier.address = patch.address;
+    if (!supplier.city && patch.city) supplier.city = patch.city;
+    if (!supplier.state && patch.state) supplier.state = patch.state;
+    if (!supplier.country && patch.country) supplier.country = patch.country;
+    if (!supplier.taxId && patch.gstin) supplier.taxId = patch.gstin;
+    // Recomputed from the merged result, not the fresh-extraction-only patch, so a field the
+    // supplier already had (before this re-enrichment) still counts toward availability.
+    supplier.contactStatus = supplier.email && supplier.phone ? 'available' : supplier.email || supplier.phone ? 'partial' : 'missing';
+    if (patch.enrichmentStatus) supplier.enrichmentStatus = patch.enrichmentStatus;
+    await this.supplierRepo.save(supplier);
+  }
+
   async listCategories(): Promise<SupplierCategory[]> {
     return this.categoryRepo.find({ order: { name: 'ASC' } });
   }

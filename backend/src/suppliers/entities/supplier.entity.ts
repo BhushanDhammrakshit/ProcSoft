@@ -70,8 +70,11 @@ export class Supplier extends BaseEntity {
   @Index()
   state?: string;
 
-  @Column({ default: 'India' })
-  country: string;
+  // No default: defaulting unknown-country discovered suppliers to 'India' previously showed
+  // wrong locations for foreign suppliers whose country genuinely couldn't be extracted.
+  // Manual/CSV creation still defaults to 'India' explicitly in SuppliersService.create().
+  @Column({ nullable: true })
+  country?: string;
 
   @Column({ nullable: true })
   website?: string;

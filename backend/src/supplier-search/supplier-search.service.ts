@@ -7,7 +7,9 @@ import { ContactStatus, SupplierCandidate } from './dto/supplier-candidate.dto';
 import { AiService, SupplierRequirement, SupplierSuggestion } from '../ai/ai.service';
 import { SuppliersService } from '../suppliers/suppliers.service';
 import { ExternalSourceService } from './external-source.service';
+import { GoogleMapsCoords } from './adapters/google-maps.adapter';
 import { SupplierEnrichmentService } from './supplier-enrichment.service';
+import { GstVerificationService } from './gst-verification.service';
 import { SupplierVerificationStatus } from '../suppliers/entities/supplier.entity';
 import { classifyUrl, UrlClassification } from './util/url-classifier.util';
 import {
@@ -17,6 +19,7 @@ import {
   normalizePhone,
   stringSimilarity,
 } from '../common/utils/normalization.util';
+import { scoreCapabilityMatch } from '../common/utils/capability-scoring.util';
 
 const DEFAULT_TARGET_COUNT = Number(process.env.SUPPLIER_SEARCH_TARGET_COUNT ?? 10);
 const DEFAULT_MIN_SCORE = Number(process.env.SUPPLIER_SEARCH_MIN_SCORE ?? 70);
@@ -63,6 +66,7 @@ export class SupplierSearchService {
     private readonly suppliersService: SuppliersService,
     private readonly externalSourceService: ExternalSourceService,
     private readonly supplierEnrichmentService: SupplierEnrichmentService,
+    private readonly gstVerificationService: GstVerificationService,
   ) {}
 
   /**
@@ -72,8 +76,17 @@ export class SupplierSearchService {
    *   -> no: create a discovery job, return it right away (pending) and run the tiered
    *          discovery + normalize/dedupe/verify/rank pipeline in the background for polling.
    */
-  async search(prompt: string, targetCount?: number, minScore?: number) {
+  async search(
+    prompt: string,
+    targetCount?: number,
+    minScore?: number,
+    coords?: GoogleMapsCoords,
+    locationOverride?: string,
+  ) {
     const criteria = await this.aiService.extractRequirement(prompt);
+    if (!criteria.location && locationOverride) {
+      criteria.location = locationOverride;
+    }
     const effectiveTargetCount = targetCount ?? DEFAULT_TARGET_COUNT;
     const effectiveMinScore = minScore ?? DEFAULT_MIN_SCORE;
 
@@ -84,6 +97,16 @@ export class SupplierSearchService {
       const ranked = this.dedupeBySupplierId(await this.aiService.rankSuppliersForRequirement(criteria, goodMatches));
       await this.suppliersService.recordMatchResults(ranked, criteria as unknown as Record<string, unknown>);
       return { criteria, source: 'database' as const, suppliers: ranked, job: null };
+    }
+
+    // Google Places is now the primary external source, and it needs a location (explicit prompt
+    // location/override or the requester's own coordinates) to search meaningfully. Rather than
+    // silently falling back to un-located results, ask the frontend to prompt the user for one.
+    if (this.externalSourceService.googleMapsEnabled && !criteria.location && !coords) {
+      const fallbackRanked = this.dedupeBySupplierId(
+        await this.aiService.rankSuppliersForRequirement(criteria, internalMatches),
+      );
+      return { criteria, source: 'location-required' as const, suppliers: fallbackRanked, job: null };
     }
 
     let job = this.jobRepo.create({
@@ -98,7 +121,7 @@ export class SupplierSearchService {
     job = await this.jobRepo.save(job);
 
     // Fire-and-forget: the frontend polls GET /suppliers/search/jobs/:id for progress/results.
-    void this.runDiscoveryJob(job.id, criteria, internalMatches).catch((err) =>
+    void this.runDiscoveryJob(job.id, criteria, internalMatches, coords).catch((err) =>
       this.logger.error('Unhandled discovery job failure', err as Error),
     );
 
@@ -117,7 +140,46 @@ export class SupplierSearchService {
     return suggestions.filter((s) => (seen.has(s.supplierId) ? false : (seen.add(s.supplierId), true)));
   }
 
-  /** Runs the discovery pipeline in the background, persisting progress for polling clients. */
+  /** Re-runs website extraction for already-discovered suppliers whose email/phone/GSTIN are
+   * still missing despite having a website - fixes cases where the original discovery pass
+   * couldn't find contact details that do exist on the site (e.g. extraction gaps, since fixed).
+   * Only fills gaps; never overwrites data the supplier already has. */
+  async reenrichMissingContacts(limit = 20): Promise<{ processed: number; updated: number }> {
+    const candidates = await this.suppliersService.findMissingContactForReenrichment(limit);
+    let updated = 0;
+    for (const supplier of candidates) {
+      if (!supplier.website) continue;
+      const { candidate } = await this.supplierEnrichmentService.enrichLead({
+        legalName: supplier.legalName,
+        website: supplier.website,
+        email: supplier.email ?? undefined,
+        phone: supplier.phone ?? undefined,
+        city: supplier.city ?? undefined,
+        state: supplier.state ?? undefined,
+        gstin: supplier.taxId ?? undefined,
+        sourceTier: supplier.sourceTier,
+      });
+      const foundSomethingNew =
+        (candidate.email && !supplier.email) ||
+        (candidate.phone && !supplier.phone) ||
+        (candidate.gstin && !supplier.taxId) ||
+        (candidate.address && !supplier.address);
+      await this.suppliersService.applyEnrichmentPatch(supplier.id, {
+        email: candidate.email,
+        phone: candidate.phone,
+        address: candidate.address,
+        city: candidate.city,
+        state: candidate.state,
+        country: candidate.country,
+        gstin: candidate.gstin ?? null,
+        enrichmentStatus: candidate.enrichmentStatus,
+      });
+      if (foundSomethingNew) updated++;
+    }
+    return { processed: candidates.length, updated };
+  }
+
+
   private async runDiscoveryJob(
     jobId: string,
     criteria: SupplierRequirement,
@@ -129,6 +191,7 @@ export class SupplierSearchService {
       city?: string;
       state?: string;
     }[],
+    coords?: GoogleMapsCoords,
   ) {
     let record = (await this.jobRepo.findOne({ where: { id: jobId } }))!;
     record.status = DiscoveryJobStatus.RUNNING;
@@ -143,6 +206,8 @@ export class SupplierSearchService {
       const { results: externalResults, tiersUsed } = await this.externalSourceService.searchTiered(
         queries,
         record.targetCount,
+        criteria.location,
+        coords,
       );
       record.tiersUsed = tiersUsed;
       record = await this.updateProgress(
@@ -167,7 +232,7 @@ export class SupplierSearchService {
           state: s.state,
           website: s.website,
           gstin: s.taxId,
-          sourceTier: 2,
+          sourceTier: 3,
         }));
 
       record = await this.updateProgress(record, 'collecting_results', '🔍 Collecting candidate supplier leads...');
@@ -261,7 +326,14 @@ export class SupplierSearchService {
       record = await this.updateProgress(record, 'ranking', '🔍 Ranking candidates against your requirement...');
 
       // Rank (product/quantity/location/verification/past-performance via the capability-matching table).
-      const combinedCandidates = [...fallbackMatches, ...created.map((s) => ({ ...s, matchScore: 0 }))];
+      // Newly-discovered suppliers otherwise entered ranking with matchScore:0, skipping the
+      // capability-matching table entirely (including its 15-point locationMatch weight) - so a
+      // discovered supplier in the wrong country scored the same as one in the right city.
+      const scoredCreated = created.map((s) => ({
+        ...s,
+        matchScore: scoreCapabilityMatch(criteria, s).total,
+      }));
+      const combinedCandidates = [...fallbackMatches, ...scoredCreated];
       const ranked = this.dedupeBySupplierId(
         await this.aiService.rankSuppliersForRequirement(criteria, combinedCandidates),
       );
@@ -437,7 +509,8 @@ export class SupplierSearchService {
   /**
    * Separates identity signals (name/website/email/phone/address/GSTIN found) from an overall
    * verification status, so a supplier is never marked "verified" just because its website loads:
-   *  - verified: reachable official site + valid GSTIN + phone
+   *  - verified: GSTIN authoritatively confirmed active via GstVerificationService (Surepass), or
+   *    (when that's unconfigured) reachable official site + shape-valid GSTIN + phone
    *  - verification_pending: good profile (name+website+contact/location+product info) but no GSTIN yet
    *  - partially_verified: name + official website + at least one contact/location signal
    *  - unverified: little else is known
@@ -447,11 +520,21 @@ export class SupplierSearchService {
     const emailValid = !!r.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(r.email);
     const phonePresent = !!r.normalizedPhone && r.normalizedPhone.length === 10;
     const hasAddress = !!(r.address || r.city || r.state);
-    const gstinValid = isValidGstin(r.gstin);
+    const gstinShapeValid = isValidGstin(r.gstin);
     const hasProfile = r.products.length > 0 || r.certifications.length > 0 || r.manufacturingCapabilities.length > 0;
     const websiteReachable = r.enrichmentStatus === 'enriched' ? true : await this.isWebsiteReachable(r.website);
 
-    if (websiteReachable && gstinValid && phonePresent) {
+    // Authoritative signal: a real GSTIN registry check beats every other heuristic below.
+    if (gstinShapeValid && this.gstVerificationService.enabled) {
+      const gstResult = await this.gstVerificationService.verify(r.gstin!);
+      if (gstResult) {
+        if (gstResult.legalName) r.legalName = gstResult.legalName;
+        if (gstResult.address && !r.address) r.address = gstResult.address;
+        if (gstResult.verified) return SupplierVerificationStatus.VERIFIED;
+      }
+    }
+
+    if (websiteReachable && gstinShapeValid && phonePresent) {
       return SupplierVerificationStatus.VERIFIED;
     }
     if (hasName && websiteReachable && (emailValid || phonePresent || hasAddress) && hasProfile) {

@@ -22,16 +22,37 @@ import {
 import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
 import TravelExploreIcon from '@mui/icons-material/TravelExplore';
 import LanguageIcon from '@mui/icons-material/Language';
+import MyLocationIcon from '@mui/icons-material/MyLocation';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { AiSupplierSearchResult, DiscoveryJob, SupplierSuggestion, getDiscoveryJob, searchSuppliersWithAi } from '../api/supplierSearch';
 import { getSupplier } from '../api/suppliers';
+
+type Coords = { latitude: number; longitude: number };
+
+/** Resolves the browser's geolocation once (triggers the native permission prompt if not yet
+ * decided). Never rejects the caller's flow - resolves to `undefined` on denial/timeout/absence
+ * so search can always proceed, just without a location bias. */
+function getBrowserLocationOnce(): Promise<Coords | undefined> {
+  if (!('geolocation' in navigator)) return Promise.resolve(undefined);
+  return new Promise((resolve) => {
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
+      () => resolve(undefined),
+      { timeout: 8000, maximumAge: 5 * 60 * 1000 },
+    );
+  });
+}
 
 export function SupplierSearchPage() {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState('');
   const [result, setResult] = useState<AiSupplierSearchResult | null>(null);
   const [selected, setSelected] = useState<SupplierSuggestion | null>(null);
+  const [locationStatus, setLocationStatus] = useState<'unknown' | 'requesting' | 'granted' | 'unavailable'>('unknown');
+  const [coords, setCoords] = useState<Coords | undefined>(undefined);
+  const [locationDialogOpen, setLocationDialogOpen] = useState(false);
+  const [manualLocation, setManualLocation] = useState('');
 
   const detailQuery = useQuery({
     queryKey: ['supplier-detail', selected?.supplierId],
@@ -40,9 +61,47 @@ export function SupplierSearchPage() {
   });
 
   const searchMutation = useMutation({
-    mutationFn: (p: string) => searchSuppliersWithAi(p),
-    onSuccess: (data) => setResult(data),
+    mutationFn: (vars: { prompt: string; coords?: Coords; locationOverride?: string }) =>
+      searchSuppliersWithAi(vars.prompt, undefined, undefined, vars.coords, vars.locationOverride),
+    onSuccess: (data) => {
+      setResult(data);
+      // Google Maps (the primary discovery source) can't run without a location - the backend
+      // still returns whatever DB matches it has, but flags that it needs one to go further.
+      setLocationDialogOpen(data.source === 'location-required');
+    },
   });
+
+  /** Silently tries browser geolocation (no popup) before submitting - the prompt itself may
+   * already contain a location, so this never blocks the initial search. */
+  const handleSearch = async () => {
+    setLocationStatus('requesting');
+    const resolvedCoords = await getBrowserLocationOnce();
+    setCoords(resolvedCoords);
+    setLocationStatus(resolvedCoords ? 'granted' : 'unavailable');
+    searchMutation.mutate({ prompt, coords: resolvedCoords });
+  };
+
+  /** "Turn on location" action inside the location-required popup - re-triggers the native
+   * browser permission prompt and resubmits the same search once coordinates are available. */
+  const handleEnableLocation = async () => {
+    setLocationStatus('requesting');
+    const resolvedCoords = await getBrowserLocationOnce();
+    setCoords(resolvedCoords);
+    if (!resolvedCoords) {
+      setLocationStatus('unavailable');
+      return;
+    }
+    setLocationStatus('granted');
+    setLocationDialogOpen(false);
+    searchMutation.mutate({ prompt, coords: resolvedCoords });
+  };
+
+  /** "Enter location manually" action inside the popup - resubmits with an explicit location. */
+  const handleManualLocationSubmit = () => {
+    if (!manualLocation.trim()) return;
+    setLocationDialogOpen(false);
+    searchMutation.mutate({ prompt, coords, locationOverride: manualLocation.trim() });
+  };
 
   const jobId = result?.job?.id;
   const jobRunning = !!result?.job && result.job.status !== 'completed' && result.job.status !== 'failed';
@@ -82,15 +141,82 @@ export function SupplierSearchPage() {
             <Button
               variant="contained"
               startIcon={<AutoAwesomeIcon />}
-              disabled={!prompt.trim() || searchMutation.isPending}
-              onClick={() => searchMutation.mutate(prompt)}
+              disabled={!prompt.trim() || searchMutation.isPending || locationStatus === 'requesting'}
+              onClick={handleSearch}
               sx={{ whiteSpace: 'nowrap', mt: 1 }}
             >
               Search
             </Button>
           </Stack>
+          {locationStatus === 'requesting' && (
+            <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1 }}>
+              <CircularProgress size={16} />
+              <Typography variant="caption" color="text.secondary">
+                Requesting your location (required to search) - allow the browser prompt...
+              </Typography>
+            </Stack>
+          )}
+          {locationStatus === 'granted' && (
+            <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1 }}>
+              <MyLocationIcon fontSize="small" color="action" />
+              <Typography variant="caption" color="text.secondary">
+                Using your current location to bias nearby results (a location mentioned in your prompt still takes
+                priority).
+              </Typography>
+            </Stack>
+          )}
+          {locationStatus === 'unavailable' && (
+            <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+              Location unavailable/denied - mention a location in your prompt for geo-targeted results.
+            </Typography>
+          )}
         </CardContent>
       </Card>
+
+      <Dialog open={locationDialogOpen} onClose={() => setLocationDialogOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>
+          <Stack direction="row" spacing={1} alignItems="center">
+            <MyLocationIcon color="primary" />
+            <Typography variant="h6" component="span">
+              Location needed to find nearby suppliers
+            </Typography>
+          </Stack>
+        </DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Our primary business search (Google Maps) needs a location to find suppliers near you. Your prompt didn't
+            mention one and browser location isn't enabled. Turn on location, or type one below.
+          </Typography>
+          <Button
+            fullWidth
+            variant="contained"
+            startIcon={locationStatus === 'requesting' ? <CircularProgress size={16} color="inherit" /> : <MyLocationIcon />}
+            onClick={handleEnableLocation}
+            disabled={locationStatus === 'requesting'}
+            sx={{ mb: 2 }}
+          >
+            {locationStatus === 'requesting' ? 'Requesting location...' : 'Turn on my location'}
+          </Button>
+          <Divider sx={{ mb: 2 }}>or</Divider>
+          <TextField
+            fullWidth
+            size="small"
+            label="Enter a city or area"
+            placeholder="e.g. Pune, Maharashtra"
+            value={manualLocation}
+            onChange={(e) => setManualLocation(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleManualLocationSubmit()}
+          />
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setLocationDialogOpen(false)} color="inherit">
+            Cancel
+          </Button>
+          <Button onClick={handleManualLocationSubmit} variant="outlined" disabled={!manualLocation.trim()}>
+            Search with this location
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       {searchMutation.isPending && (
         <Stack alignItems="center" sx={{ my: 4 }} spacing={1}>
@@ -230,29 +356,37 @@ export function SupplierSearchPage() {
                 <Typography variant="subtitle2" gutterBottom>
                   Contact & profile
                 </Typography>
-                <Stack spacing={0.5}>
-                  <Typography variant="body2">
-                    Email: {detailQuery.data?.email && !detailQuery.data.email.includes('needs-contact')
-                      ? detailQuery.data.email
-                      : 'Not available'}
-                  </Typography>
-                  <Typography variant="body2">Phone: {detailQuery.data?.phone ?? 'Not available'}</Typography>
-                  <Typography variant="body2">
-                    Location: {[detailQuery.data?.city, detailQuery.data?.state, detailQuery.data?.country]
-                      .filter(Boolean)
-                      .join(', ') || 'Not available'}
-                  </Typography>
-                  <Typography variant="body2">
-                    Website:{' '}
-                    {detailQuery.data?.website ? (
-                      <Link href={detailQuery.data.website} target="_blank" rel="noopener noreferrer">
-                        {detailQuery.data.website}
-                      </Link>
-                    ) : (
-                      'Not available'
-                    )}
-                  </Typography>
-                  <Typography variant="body2">Tax ID / GSTIN: {detailQuery.data?.taxId ?? 'Not available'}</Typography>
+                {(() => {
+                  const data = detailQuery.data;
+                  const email = data?.email && !data.email.includes('needs-contact') ? data.email : undefined;
+                  const location = [data?.city, data?.state, data?.country].filter(Boolean).join(', ') || undefined;
+                  const hasAnyContact = !!(email || data?.phone || location || data?.address || data?.website || data?.taxId);
+                  if (!hasAnyContact) {
+                    return (
+                      <Typography variant="body2" color="text.secondary">
+                        No contact information available for this supplier.
+                      </Typography>
+                    );
+                  }
+                  return (
+                    <Stack spacing={0.5}>
+                      {email && <Typography variant="body2">Email: {email}</Typography>}
+                      {data?.phone && <Typography variant="body2">Phone: {data.phone}</Typography>}
+                      {data?.address && <Typography variant="body2">Address: {data.address}</Typography>}
+                      {location && <Typography variant="body2">Location: {location}</Typography>}
+                      {data?.website && (
+                        <Typography variant="body2">
+                          Website:{' '}
+                          <Link href={data.website} target="_blank" rel="noopener noreferrer">
+                            {data.website}
+                          </Link>
+                        </Typography>
+                      )}
+                      {data?.taxId && <Typography variant="body2">Tax ID / GSTIN: {data.taxId}</Typography>}
+                    </Stack>
+                  );
+                })()}
+                <Stack spacing={0.5} sx={{ mt: 0.5 }}>
                   <Typography variant="body2">
                     Status: {detailQuery.data?.status} · Source: {detailQuery.data?.source ?? 'unknown'}
                     {detailQuery.data?.sourceTier ? ` (tier ${detailQuery.data.sourceTier})` : ''}
